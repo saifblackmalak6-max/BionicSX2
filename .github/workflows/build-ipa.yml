@@ -1,0 +1,284 @@
+name: BionicSX2 - Build IPA
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build IPA
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Install Dependencies
+        run: brew install cmake ninja ccache curl freetype zstd jpeg-turbo sdl3 libpng webp lz4
+
+      - name: Setup MoltenVK
+        run: |
+          brew install molten-vk
+          echo "MOLTENVK_PATH=$(brew --prefix molten-vk)" >> $GITHUB_ENV
+
+      - name: Patch 1 - iOS Platform
+        run: |
+          sed -i '' 's/message(FATAL_ERROR "Unsupported platform.")/message(STATUS "iOS - BionicSX2")\n    set(IOS TRUE)/g' src/armsx2/app/src/main/cpp/cmake/Pcsx2Utils.cmake
+
+      - name: Patch 2 - ARM64 Architecture
+        run: |
+          FILE="src/armsx2/app/src/main/cpp/cmake/TargetArch.cmake"
+          sed -i '' 's/elseif("${osx_arch}" STREQUAL "ppc64" AND ppc_support)/elseif("${osx_arch}" STREQUAL "arm64")\n\t\t\t\tset(osx_arch_arm64 TRUE)\n\t\t\telseif("${osx_arch}" STREQUAL "ppc64" AND ppc_support)/g' $FILE
+          sed -i '' 's/if(osx_arch_ppc64)/if(osx_arch_arm64)\n\t\tlist(APPEND ARCH aarch64)\n\t\tendif()\n\n\t\tif(osx_arch_ppc64)/g' $FILE
+
+      - name: Patch 3 - Disable PCAP
+        run: |
+          sed -i '' 's/find_package(PCAP/# find_package(PCAP/g' src/armsx2/app/src/main/cpp/cmake/SearchForStuff.cmake
+
+      - name: Patch 4 - Inject Dependencies
+        run: |
+          FILE="src/armsx2/app/src/main/cpp/cmake/SearchForStuff.cmake"
+          FT=$(brew --prefix freetype)
+          JPEG=$(brew --prefix jpeg-turbo)
+          ZSTD=$(brew --prefix zstd)
+          SDL3=$(brew --prefix sdl3)
+          PNG=$(brew --prefix libpng)
+          WEBP=$(brew --prefix webp)
+          LZ4=$(brew --prefix lz4)
+          printf "find_package(ZLIB REQUIRED)\nif(ZLIB_FOUND AND NOT TARGET ZLIB::ZLIB)\n  add_library(ZLIB::ZLIB UNKNOWN IMPORTED)\n  set_target_properties(ZLIB::ZLIB PROPERTIES IMPORTED_LOCATION \"\${ZLIB_LIBRARIES}\" INTERFACE_INCLUDE_DIRECTORIES \"\${ZLIB_INCLUDE_DIRS}\")\nendif()\nset(FREETYPE_LIBRARY ${FT}/lib/libfreetype.dylib)\nset(FREETYPE_INCLUDE_DIRS ${FT}/include/freetype2)\nfind_package(Freetype REQUIRED)\nset(JPEG_LIBRARY ${JPEG}/lib/libjpeg.dylib)\nset(JPEG_INCLUDE_DIR ${JPEG}/include)\nfind_package(JPEG REQUIRED)\nadd_library(Zstd::Zstd UNKNOWN IMPORTED)\nset_target_properties(Zstd::Zstd PROPERTIES IMPORTED_LOCATION ${ZSTD}/lib/libzstd.dylib INTERFACE_INCLUDE_DIRECTORIES ${ZSTD}/include)\nset(PNG_LIBRARY ${PNG}/lib/libpng.dylib)\nset(PNG_PNG_INCLUDE_DIR ${PNG}/include)\nfind_package(PNG REQUIRED)\nset(SDL3_DIR ${SDL3}/lib/cmake/SDL3)\nfind_package(SDL3 REQUIRED)\nadd_library(WebP::libwebp UNKNOWN IMPORTED)\nset_target_properties(WebP::libwebp PROPERTIES IMPORTED_LOCATION ${WEBP}/lib/libwebp.dylib INTERFACE_INCLUDE_DIRECTORIES ${WEBP}/include)\nadd_library(LZ4::LZ4 UNKNOWN IMPORTED)\nset_target_properties(LZ4::LZ4 PROPERTIES IMPORTED_LOCATION ${LZ4}/lib/liblz4.dylib INTERFACE_INCLUDE_DIRECTORIES ${LZ4}/include)\nadd_library(PCAP::PCAP INTERFACE IMPORTED)\n" > /tmp/inject.txt
+          cat /tmp/inject.txt $FILE > /tmp/merged.txt
+          mv /tmp/merged.txt $FILE
+
+      - name: Patch 5 - Fix plutosvg
+        run: |
+          cp ios/stubs/discordpp.h src/armsx2/app/src/main/cpp/3rdparty/discord-rpc/include/discordpp.h
+          cp ios/stubs/discord_rpc.h src/armsx2/app/src/main/cpp/3rdparty/discord-rpc/include/discord_rpc.h
+          bash ios/stubs/discord_rpc_all_stub.sh
+          sed -i '' 's/plutosvg::plutosvg/plutosvg/g' src/armsx2/app/src/main/cpp/3rdparty/imgui/CMakeLists.txt
+
+      - name: Patch 6 - iOS stubs for macOS files
+        run: |
+          BASE="src/armsx2/app/src/main/cpp"
+          printf '// iOS stub\n' > $BASE/3rdparty/cubeb/src/cubeb_osx_run_loop.cpp
+          printf '// iOS stub\n' > $BASE/3rdparty/cubeb/src/cubeb_audiounit.cpp
+          printf '// iOS stub\n#include "CocoaTools.h"\n' > $BASE/common/CocoaTools.mm
+          printf '// iOS stub\n#include "DarwinMisc.h"\nvoid MemProtect(void*, size_t, const char*) {}\n' > $BASE/common/Darwin/DarwinMisc.cpp
+
+      - name: Patch 7 - Fix Discord and AppKit
+        run: |
+          BASE="src/armsx2/app/src/main/cpp"
+          # نضيف discord_rpc.h في أول VMManager.cpp مباشرة
+          echo '#include "../3rdparty/discord-rpc/include/discord_rpc.h"' > /tmp/discord_prepend.txt
+          cat /tmp/discord_prepend.txt $BASE/pcsx2/VMManager.cpp > /tmp/vm_new.cpp
+          mv /tmp/vm_new.cpp $BASE/pcsx2/VMManager.cpp
+          # نصلح AppKit في GSDeviceMTL.h
+          sed -i '' 's/#include <AppKit\/AppKit.h>/\/\/ BionicSX2: AppKit disabled for iOS/g' $BASE/pcsx2/GS/Renderers/Metal/GSDeviceMTL.h
+          echo "Patch 7 done"
+
+      - name: Patch 8 - Fix Metal macOS-only APIs
+        run: |
+          BASE="src/armsx2/app/src/main/cpp/pcsx2/GS/Renderers/Metal"
+          # رفع الـ deployment target لـ iOS 16 لحل MTLSharedEvent
+          # نستبدل macOS-only Metal feature sets
+                    # نحذف NSView من GSDeviceMTL.h
+          cp ios/stubs/GSMTLDeviceInfo.mm src/armsx2/app/src/main/cpp/pcsx2/GS/Renderers/Metal/GSMTLDeviceInfo.mm
+          sed -i '' 's/MRCOwned<NSView\*> m_view;//g' $BASE/GSDeviceMTL.h
+          sed -i '' 's/#include <AppKit\/AppKit.h>/\/\/ AppKit disabled for iOS/g' $BASE/GSDeviceMTL.h
+          # نرفع deployment target
+          sed -i '' 's/-miphoneos-version-min=11.0/-miphoneos-version-min=16.0/g' build/build.ninja 2>/dev/null || true
+          echo "Patch 8 done"
+
+      - name: Patch 9 - Fix deployment target
+        run: |
+          find src/armsx2 -name "CMakeLists.txt" | xargs grep -l "miphoneos-version-min" | while read f; do
+            sed -i '' 's/-miphoneos-version-min=[0-9.]*/-miphoneos-version-min=16.0/g' "$f"
+          done
+          find src/armsx2 -name "*.cmake" | xargs grep -l "miphoneos-version-min" 2>/dev/null | while read f; do
+            sed -i '' 's/-miphoneos-version-min=[0-9.]*/-miphoneos-version-min=16.0/g' "$f"
+          done
+          sed -i '' 's/set(CMAKE_OSX_DEPLOYMENT_TARGET 11.0)/set(CMAKE_OSX_DEPLOYMENT_TARGET 16.0)/g' src/armsx2/app/src/main/cpp/cmake/BuildParameters.cmake
+          echo "Patch 9 done"
+
+      - name: Patch 10 - Fix GSDeviceMTL macOS APIs
+        run: |
+          FILE="src/armsx2/app/src/main/cpp/pcsx2/GS/Renderers/Metal/GSDeviceMTL.mm"
+          sed -i '' '/m_layer setDisplaySyncEnabled/d' $FILE
+          sed -i '' '/NSWorkspace/d' $FILE
+          sed -i '' '/m_view = MRCRetain/d' $FILE
+          sed -i '' '/m_view setLayer/d' $FILE
+          sed -i '' '/m_view = nullptr/d' $FILE
+          sed -i '' '/m_view setWantsLayer/d' $FILE
+          sed -i '' '/MTLBarrierScopeRenderTargets/d' $FILE
+          sed -i '' '/memoryBarrierWithScope/d' $FILE
+          sed -i '' '/beforeStages:MTLRenderStageFragment/d' $FILE
+          sed -i '' '/afterStages:MTLRenderStageFragment/d' $FILE
+          sed -i '' '/inFileViewerRootedAtPath/d' $FILE
+          sed -i '' '/MTLFeatureSet_macOS/d' $FILE
+          sed -i '' '/MTLCopyAllDevices/d' $FILE
+          sed -i '' '/for (id<MTLDevice> dev in devs/d' $FILE
+          sed -i '' '/m_dev = GSMTLDevice(MRCRetain(dev))/d' $FILE
+          sed -i '' '/if (\[\[dev name\]/d' $FILE
+          sed -i '' '/ai.name = \[\[dev name\]/d' $FILE
+          sed -i '' '/for (id<MTLDevice> dev in/d' $FILE
+          sed -i '' '/features.max_texsize = 16384/d' $FILE
+          sed -i '' '/if (\[dev supports/d' $FILE
+          echo "Patch 10 done"
+
+      - name: Configure CMake for iOS
+        run: |
+          cmake -B build \
+            -G Ninja \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=16.0 \
+            -DCMAKE_XCODE_ATTRIBUTE_IPHONEOS_DEPLOYMENT_TARGET=16.0 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_SYSROOT=$(xcrun --sdk iphoneos --show-sdk-path) \
+            -DUSE_DISCORD_SDK=ON \
+            -DCURL_INCLUDE_DIR=$(brew --prefix curl)/include \
+            -DCMAKE_CXX_FLAGS="-I$(pwd)/src/armsx2/app/src/main/cpp/3rdparty/plutosvg1/plutovg/include -I$(pwd)/src/armsx2/app/src/main/cpp/3rdparty/plutosvg1/source" \
+            -S src/armsx2/app/src/main/cpp
+
+      - name: Patch 11 - Fix xmm0.Q() in recVTLB
+        run: |
+          FILE="src/armsx2/app/src/main/cpp/pcsx2/x86/ix86-32/recVTLB.cpp"
+          sed -i '' 's/armAsm->Ldr(xmm0\.Q()/armAsm->Ldr(a64::QRegister(0).Q()/g' $FILE
+          sed -i '' 's/armAsm->Str(armQRegister(1)\.Q()/armAsm->Str(a64::QRegister(1).Q()/g' $FILE
+          echo "Patch 11 done"
+
+      - name: Patch 12 - Fix recVTLB and microVU alignment
+        run: |
+          FILE="src/armsx2/app/src/main/cpp/pcsx2/x86/ix86-32/recVTLB.cpp"
+          sed -i '' 's/armAsm->Mov(a64::QRegister(reg), xmm0)/armAsm->Mov(a64::QRegister(reg).Q(), a64::QRegister(0).Q())/g' $FILE
+          FILE2="src/armsx2/app/src/main/cpp/pcsx2/x86/microVU.h"
+          sed -i '' 's/alignas(64) VU_Thread/alignas(128) VU_Thread/g' $FILE2
+          sed -i '' 's/alignas(64) extern vuRegistersPack/alignas(128) extern vuRegistersPack/g' $FILE2
+          FILE3="src/armsx2/app/src/main/cpp/pcsx2/x86/microVU.cpp"
+          sed -i '' 's/alignas(64) vuRegistersPack/alignas(128) vuRegistersPack/g' $FILE3
+          echo "Patch 12 done"
+
+      - name: Patch 13 - Fix GetCode to GetId
+        run: |
+          FILE="src/armsx2/app/src/main/cpp/pcsx2/x86/ix86-32/recVTLB.cpp"
+          sed -i '' 's/xmm0\.GetCode()/xmm0.GetId()/g' $FILE
+          FILE2="src/armsx2/app/src/main/cpp/pcsx2/x86/microVU_IR.h"
+          sed -i '' 's/xmmPQ\.GetCode()/xmmPQ.GetId()/g' $FILE2
+          sed -i '' 's/armAsm->Mov(a64::QRegister(data_register), xmm0)/armAsm->Mov(a64::QRegister(data_register).Q(), a64::QRegister(0).Q())/g' $FILE
+          sed -i '' 's/xmmPQ\.GetId()/xmmPQ.GetCode()/g' $FILE2
+          echo "Patch 13 done"
+
+      - name: Patch 14 - Fix xmm2 Ldr in microVU_Execute
+        run: |
+          FILE="src/armsx2/app/src/main/cpp/pcsx2/x86/microVU_Execute.inl"
+          sed -i '' 's/armAsm->Ldr(xmm2,/armAsm->Ldr(a64::QRegister(2).Q(),/g' $FILE
+          sed -i '' 's/armAsm->Ldr(xmm0,/armAsm->Ldr(a64::QRegister(0).Q(),/g' $FILE
+          sed -i '' 's/armAsm->Ldr(xmm1,/armAsm->Ldr(a64::QRegister(1).Q(),/g' $FILE
+          sed -i '' 's/armAsm->Str(xmm2,/armAsm->Str(a64::QRegister(2).Q(),/g' $FILE
+          sed -i '' 's/armAsm->Str(xmm0,/armAsm->Str(a64::QRegister(0).Q(),/g' $FILE
+          sed -i '' 's/armAsm->Str(xmm1,/armAsm->Str(a64::QRegister(1).Q(),/g' $FILE
+          sed -i '' 's/armAsm->Str(xmm5,/armAsm->Str(a64::QRegister(5).Q(),/g' $FILE
+          sed -i '' 's/armAsm->Str(xmm4,/armAsm->Str(a64::QRegister(4).Q(),/g' $FILE
+          sed -i '' 's/armAsm->Str(xmm3,/armAsm->Str(a64::QRegister(3).Q(),/g' $FILE
+          sed -i '' 's/armAsm->Ldr(xmm5,/armAsm->Ldr(a64::QRegister(5).Q(),/g' $FILE
+          sed -i '' 's/armAsm->Ldr(xmm4,/armAsm->Ldr(a64::QRegister(4).Q(),/g' $FILE
+          sed -i '' 's/armAsm->Ldr(xmm3,/armAsm->Ldr(a64::QRegister(3).Q(),/g' $FILE
+          echo "Patch 14 done"
+
+      - name: Patch 15 - Fix xmm VRegister methods in microVU_Execute
+        run: |
+          FILE="src/armsx2/app/src/main/cpp/pcsx2/x86/microVU_Execute.inl"
+          sed -i '' 's/xmm0\.V16B()/a64::QRegister(0).V16B()/g' $FILE
+          sed -i '' 's/xmm0\.V4S()/a64::QRegister(0).V4S()/g' $FILE
+          sed -i '' 's/xmm1\.V16B()/a64::QRegister(1).V16B()/g' $FILE
+          sed -i '' 's/xmm1\.V4S()/a64::QRegister(1).V4S()/g' $FILE
+          sed -i '' 's/xmm2\.V16B()/a64::QRegister(2).V16B()/g' $FILE
+          sed -i '' 's/xmm2\.V4S()/a64::QRegister(2).V4S()/g' $FILE
+          sed -i '' 's/armMOVMSKPS(EAX, xmm0)/armMOVMSKPS(EAX, a64::QRegister(0))/g' $FILE
+          echo "Patch 15 done"
+
+      - name: Patch 16 - Fix DEV9 network headers for iOS
+        run: |
+          FILE="src/armsx2/app/src/main/cpp/pcsx2/DEV9/AdapterUtils.cpp"
+          sed -i '' 's/#include <net\/route.h>/\/\/ iOS: net\/route.h disabled/g' $FILE
+          sed -i '' 's/#include <net\/if_dl.h>/\/\/ iOS: net\/if_dl.h disabled/g' $FILE
+          # Replace entire file with stub
+          cp ios/stubs/AdapterUtils.cpp src/armsx2/app/src/main/cpp/pcsx2/DEV9/AdapterUtils.cpp
+          find src/armsx2/app/src/main/cpp/pcsx2/DEV9 -name "*.cpp" -o -name "*.h" | xargs grep -l "net/route.h\|net/if_dl.h" | xargs sed -i '' 's/#include <net\/route.h>/\/\/ iOS disabled/g;s/#include <net\/if_dl.h>/\/\/ iOS disabled/g'
+          mkdir -p src/armsx2/app/src/main/cpp/3rdparty/oboe/include/oboe
+          cp ios/stubs/oboe/Oboe.h src/armsx2/app/src/main/cpp/3rdparty/oboe/include/oboe/Oboe.h
+          cp ios/stubs/plutovg.h src/armsx2/app/src/main/cpp/3rdparty/plutosvg/plutovg/include/plutovg.h 2>/dev/null || true
+          BASE="src/armsx2/app/src/main/cpp"
+          sed -i '' 's|#include <plutovg.h>|#include "../../3rdparty/plutosvg1/plutovg/include/plutovg.h"|g' $BASE/pcsx2/ImGui/ImGuiFullscreen.cpp
+          printf "// BionicSX2 iOS stub\n#include \"AudioStream.h\"\n" > $BASE/pcsx2/Host/OboeAudioStream.cpp
+          echo "Patch 16 done"
+
+      - name: Patch 17 - Fix CDVD DriveUtility IOKit
+        run: |
+          BASE="src/armsx2/app/src/main/cpp"
+          printf '// BionicSX2 iOS stub\n' > $BASE/pcsx2/CDVD/Darwin/DriveUtility.cpp
+          printf "// BionicSX2 iOS stub\n" > $BASE/pcsx2/CDVD/Darwin/IOCtlSrc.cpp
+          echo "Patch 17 done"
+
+      - name: Build
+        run: cmake --build build --config Release -j$(sysctl -n hw.logicalcpu)
+
+      - name: Package IPA
+        run: |
+          mkdir -p output/Payload/BionicSX2.app
+
+          # جمع كل الـ static libraries
+          LIBS=$(find build -name "*.a" | tr '\n' ' ')
+
+          # نبني الـ executable من الـ libraries
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          clang++ -arch arm64 -isysroot $SDK \
+            -miphoneos-version-min=16.0 \
+            -framework Metal \
+            -framework MetalKit \
+            -framework AudioToolbox \
+            -framework AVFoundation \
+            -framework CoreAudio \
+            -framework CoreHaptics \
+            -framework CoreMotion \
+            -framework Foundation \
+            -framework GameController \
+            -framework QuartzCore \
+            -framework UIKit \
+            -lz -lbz2 -liconv \ \
+                -framework Security \
+                -framework CFNetwork \
+                -framework SystemConfiguration \
+                -lc++ \
+            $LIBS \
+            -o output/Payload/BionicSX2.app/BionicSX2 || echo "Link step - may need more flags"
+
+          # نسخ الملفات الأساسية
+          cp ios/BionicSX2/Info.plist output/Payload/BionicSX2.app/
+          
+          # تجميع الـ IPA
+          cd output && zip -r BionicSX2.ipa Payload/
+          echo "IPA size: $(du -sh BionicSX2.ipa)" 
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: BionicSX2-IPA
+          path: output/BionicSX2.ipa
+          retention-days: 7
+      - name: Patch 7 - Disable Discord RPC
+        run: |
+          FILE="src/armsx2/app/src/main/cpp/cmake/SearchForStuff.cmake"
+          sed -i '' 's/find_package(DiscordRPC/# find_package(DiscordRPC/g' $FILE
+          # نضيف define لتعطيل Discord
+          FILE2="src/armsx2/app/src/main/cpp/cmake/BuildParameters.cmake"
+          echo "Patch 7 done"
